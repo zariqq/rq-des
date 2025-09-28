@@ -1,12 +1,10 @@
 import numpy as np
-from numba import jit, njit, cuda
-import torch
-import warnings
+from numba import jit, njit, config, threading_layer
 
-warnings.filterwarnings("ignore")
+config.NUMBA_THREADING_LAYER_PRIORITY = "tbb omp workqueue"
 
 
-# @njit(inline="always")
+@njit(inline="always")
 def set_one(arr, i, dt):
     if i >= len(arr):
         arr.append(0.0)
@@ -14,104 +12,53 @@ def set_one(arr, i, dt):
     arr[i] += dt
 
 
-# coefficets of parametrs
 @njit(inline="always")
-def koefs(tp):
-    if tp[0] == 0:
-        if tp[1] == 0:  # i = n = 0
-            return np.array(
-                [[1, np.inf, np.inf, np.inf, np.inf], [1, 1, 1, np.inf, np.inf]],
-                "float64",
-            )[tp[2]]
-        else:  # i = 0, n > 0
-            return np.array(
-                [[1, np.inf, np.inf, np.inf, 1 / tp[1]], [1, 1, 1, np.inf, 1 / tp[1]]],
-                "float64",
-            )[tp[2]]
-    else:
-        if tp[1] == 0:  # i > 0, n = 0
-            return np.array(
-                [[1, np.inf, np.inf, 1 / tp[0], np.inf], [1, 1, 1, np.inf, np.inf]],
-                "float64",
-            )[tp[2]]
-        else:  # i > 0, n > 0
-            return np.array(
-                [
-                    [1, np.inf, np.inf, 1 / tp[0], 1 / tp[1]],
-                    [1, 1, 1, np.inf, 1 / tp[1]],
-                ],
-                "float64",
-            )[tp[2]]
+def find_min_index(arr):
+    idx = 0
+    if arr[1] < arr[idx]:
+        idx = 1
+    if arr[2] < arr[idx]:
+        idx = 2
+    if arr[3] < arr[idx]:
+        idx = 3
+    if arr[4] < arr[idx]:
+        idx = 4
+    return idx
 
 
-@njit(inline="always")
-def get_state_config(lam=0.8, gam=2.0, mu=1, sig1=0.08, sig2=0.07):
-    inv_lam = np.inf if lam == 0 else 1.0 / lam
-    inv_gam = np.inf if gam == 0 else 1.0 / gam
-    inv_mu = np.inf if mu == 0 else 1.0 / mu
-    inv_sig1 = np.inf if sig1 == 0 else 1.0 / sig1
-    inv_sig2 = np.inf if sig2 == 0 else 1.0 / sig2
-
-    STATE_EDGES = np.array(
+STATE_STEPS = np.array(
+    [
         [
-            [
-                [  # i = 0, n = 0
-                    [inv_lam, np.inf, np.inf, np.inf, np.inf],
-                    [inv_lam, inv_gam, inv_mu, np.inf, np.inf],
-                ],
-                [  # i = 0, n > 1
-                    [inv_lam, np.inf, np.inf, np.inf, inv_sig2],
-                    [inv_lam, inv_gam, inv_mu, np.inf, inv_sig2],
-                ],
+            [  # i = 0, n = 0
+                [[0, 0, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],  # k = 0
+                [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [0, 0, 0]],  # k = 1
             ],
-            [
-                [  # i > 1, n = 0
-                    [inv_lam, np.inf, np.inf, inv_sig1, np.inf],
-                    [inv_lam, inv_gam, inv_mu, np.inf, np.inf],
-                ],
-                [  # i > 0, n > 0
-                    [inv_lam, np.inf, np.inf, inv_sig1, inv_sig2],
-                    [inv_lam, inv_gam, inv_mu, np.inf, inv_sig2],
-                ],
+            [  # i = 0, n > 0
+                [[0, 0, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, -1, 1]],
+                [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [1, -1, 0]],
             ],
         ],
-        "float64",
-    )
-
-    STATE_STEPS = np.array(
         [
-            [
-                [  # i = 0, n = 0
-                    [[0, 0, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],  # k = 0
-                    [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [0, 0, 0]],  # k = 1
-                ],
-                [  # i = 0, n > 0
-                    [[0, 0, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, -1, 1]],
-                    [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [1, -1, 0]],
-                ],
+            [  # i > 0, n = 0
+                [[0, 0, 1], [0, 0, 0], [0, 0, 0], [-1, 0, 1], [0, 0, 0]],
+                [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [0, 0, 0]],
             ],
-            [
-                [  # i > 0, n = 0
-                    [[0, 0, 1], [0, 0, 0], [0, 0, 0], [-1, 0, 1], [0, 0, 0]],
-                    [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [0, 0, 0]],
-                ],
-                [  # i > 0, n > 0
-                    [[0, 0, 1], [0, 0, 0], [0, 0, 0], [-1, 0, 1], [0, -1, 1]],
-                    [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [1, -1, 0]],
-                ],
+            [  # i > 0, n > 0
+                [[0, 0, 1], [0, 0, 0], [0, 0, 0], [-1, 0, 1], [0, -1, 1]],
+                [[1, 0, 0], [0, 1, -1], [0, 0, -1], [0, 0, 0], [1, -1, 0]],
             ],
         ],
-        "int8",
-    )
+    ],
+    r"int8",
+)
 
-    return STATE_EDGES, STATE_STEPS
 
-
+@jit(nopython=True, parallel=True)
 def random_generator():
-    res = -torch.log(1 - torch.rand(10_000_000, device="mps"))
-    return res.cpu().numpy()
+    return -np.log(1 - np.random.uniform(0, 1, 100_000_000))
 
 
+@jit(nopython=True)
 def run_i_n(
     sim_time_lim,
     lam=np.float64(0.8),
@@ -120,8 +67,6 @@ def run_i_n(
     sig1=np.float64(0.08),
     sig2=np.float64(0.07),
 ):
-    STATE_EDGES, STATE_STEPS = get_state_config(lam, gam, mu, sig1, sig2)
-
     buffer = random_generator()
     current_idx = 0
 
@@ -129,43 +74,72 @@ def run_i_n(
     p_i = []
     p_n = []
 
-    current_state = np.array([0, 0, 0], "int32")
-    dts = np.array([1, 1, 1, 1, 1], "float64")
+    i, n, k = (0, 0, 0)
+    dts = np.array([1, 1, 1, 1, 1], r"float64")
 
-    print("* * *")
     while t < sim_time_lim:
-
-        edges = STATE_EDGES[
-            (current_state[0] > 0) * 1, (current_state[1] > 0) * 1, current_state[2]
-        ]
-
-        dts[:] = buffer[current_idx : current_idx + 5] * koefs(current_state) * edges
+        dts[0] = buffer[current_idx + 0] / lam
+        dts[1] = buffer[current_idx + 1] / gam
+        dts[2] = buffer[current_idx + 2] / mu
+        dts[3] = buffer[current_idx + 3]
+        dts[4] = buffer[current_idx + 4]
 
         current_idx += 5
 
-        min_idx = np.nanargmin(dts)
+        ci, cn = (i > 0, n > 0)
 
-        set_one(p_i, current_state[0], dts[min_idx])
-        set_one(p_n, current_state[1], dts[min_idx])
+        if k == 0:
+            dts[1] = dts[2] = np.inf
+            dts[3] = dts[3] / (i * sig1) if ci else np.inf
+        else:
+            dts[3] = np.inf
+        dts[4] = dts[4] / (n * sig2) if cn else np.inf
+
+        min_idx = find_min_index(dts)
+
+        if i >= len(p_i):
+            p_i.append(0.0)
+
+        if n >= len(p_n):
+            p_n.append(0.0)
+
+        p_i[i] += dts[min_idx]
+        p_n[n] += dts[min_idx]
 
         t += dts[min_idx]
-        current_state += STATE_STEPS[
-            (current_state[0] > 0) * 1,
-            (current_state[1] > 0) * 1,
-            current_state[2],
-        ][min_idx]
+        i += STATE_STEPS[ci * 1, cn * 1, k][min_idx][0]
+        n += STATE_STEPS[ci * 1, cn * 1, k][min_idx][1]
+        k += STATE_STEPS[ci * 1, cn * 1, k][min_idx][2]
 
-        if current_idx + 11 >= len(buffer):  # run out buffer
+        if current_idx + 11 >= 100_000_000:
             buffer = random_generator()
             current_idx = 0
 
-    np_p_i = np.array(p_i, "float64")
-    np_p_n = np.array(p_n, "float64")
-
-    np.divide(np_p_i, t, np_p_i)
-    np.divide(np_p_n, t, np_p_n)
-
-    return np_p_i, np_p_n
+    return p_i, p_n
 
 
-run_i_n(10)
+def sim(
+    sim_time_lim,
+    it=5,
+    lam=np.float64(0.8),
+    gam=np.float64(2.0),
+    mu=np.float64(1),
+    sig1=np.float64(0.08),
+    sig2=np.float64(0.07),
+):
+    experiments = np.zeros((2 * it, 500), "float64")
+    for i in range(it):
+        pi, pn = run_i_n(sim_time_lim, lam, gam, mu, sig1, sig2)
+
+        for j in range(len(pi)):
+            experiments[i * 2][j] += pi[j]
+        for j in range(len(pn)):
+            experiments[i * 2 + 1][j] += pn[j]
+
+    mn_pi = np.mean(experiments[::2], 0)
+    mn_pn = np.mean(experiments[1::2], 0)
+
+    return (mn_pi / mn_pi.sum(), mn_pn / mn_pn.sum())
+
+
+sim(10**5, 2)
